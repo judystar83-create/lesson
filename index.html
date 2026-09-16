@@ -89,7 +89,8 @@ header.bar h1{font-size:18px;font-weight:600;margin:0;flex:1;min-width:0;white-s
 .region-preview{position:absolute;border:2px solid #2F5D8A;background:rgba(47,93,138,.15);pointer-events:none}
 .anchor{position:absolute;display:flex;flex-direction:column-reverse;align-items:flex-start;gap:calc(var(--pw)*.004);pointer-events:none;max-width:calc(var(--pw)*.9)}
 .cmt{pointer-events:auto;position:relative;background:rgba(255,255,255,.88);border-radius:calc(var(--pw)*.006);padding:0 calc(var(--pw)*.008);line-height:1.2;white-space:pre-wrap;touch-action:none;box-shadow:0 1px 0 rgba(0,0,0,.08);cursor:grab;max-width:calc(var(--pw)*.6)}
-.mode-region .cmt,.mode-pen .cmt{pointer-events:none}
+.mode-pen .cmt{pointer-events:none}
+.mode-region .cmt{pointer-events:auto}
 .cmt .aud{display:inline-block;font-family:var(--ui);font-size:.6em;vertical-align:.25em;margin-right:.3em;opacity:.7}
 .item{position:absolute;transform:translate(-50%,-50%);line-height:1;white-space:nowrap;touch-action:none;cursor:grab;padding:.1em .15em}
 .mode-region .item,.mode-pen .item{pointer-events:none}
@@ -101,6 +102,11 @@ header.bar h1{font-size:18px;font-weight:600;margin:0;flex:1;min-width:0;white-s
 .staff svg{width:100%;height:100%;display:block}
 .mode-region .staff,.mode-pen .staff{pointer-events:none}
 .mode-staff .staff{cursor:crosshair;box-shadow:0 0 0 2px #2F5D8A}
+.staff .hdl{position:absolute;width:30px;height:30px;border-radius:50%;background:#2F5D8A;color:#fff;display:flex;align-items:center;justify-content:center;font-size:15px;line-height:1;box-shadow:0 1px 4px rgba(0,0,0,.3);touch-action:none;pointer-events:auto;z-index:2;font-family:var(--ui)}
+.staff .hdl-move{left:-12px;top:-12px}
+.staff .hdl-size{right:-12px;bottom:-12px}
+.mode-region .staff .hdl,.mode-pen .staff .hdl{display:none}
+#undoBtn[disabled]{opacity:.35}
 
 /* Toolbars */
 #optbar{background:var(--surface);border-top:1px solid var(--line);padding:8px 10px;display:flex;gap:6px;align-items:center;overflow-x:auto;min-height:52px;scrollbar-width:none}
@@ -185,6 +191,7 @@ textarea{min-height:96px;resize:vertical}
     <header class="bar">
       <button class="icon-btn" data-act="home" aria-label="악보 목록">‹ 목록</button>
       <h1 id="scoreTitle" role="button" tabindex="0" title="이름 바꾸기"></h1>
+      <button class="icon-btn" id="undoBtn" data-act="undo" aria-label="되돌리기" title="되돌리기" disabled>↶</button>
       <button class="icon-btn" data-act="zoom-out" aria-label="축소">−</button>
       <button class="icon-btn" data-act="zoom-in" aria-label="확대">＋</button>
       <button class="icon-btn" data-act="menu" aria-label="더보기">⋯</button>
@@ -306,8 +313,31 @@ const getAllKeys=store=>memFallback?Promise.resolve([...mem[store].keys()]):tx(s
 
 let saveTimer=null;
 function saveSoon(){clearTimeout(saveTimer);saveTimer=setTimeout(saveNow,350);}
+/* undo: remember how the marks looked before each change */
+let undoStack=[], lastItems=null, lastPushAt=0;
+function resetUndo(){undoStack=[];lastItems=cur?JSON.stringify(cur.items):null;updateUndoBtn();}
+function updateUndoBtn(){const b=document.getElementById('undoBtn');if(b)b.disabled=!undoStack.length;}
+function trackUndo(){
+  if(!cur)return; const now=JSON.stringify(cur.items);
+  if(lastItems!==null&&now!==lastItems){
+    if(Date.now()-lastPushAt>900||!undoStack.length){undoStack.push(lastItems);if(undoStack.length>60)undoStack.shift();}
+    lastPushAt=Date.now();
+  }
+  lastItems=now; updateUndoBtn();
+}
+async function undo(){
+  if(!cur)return; await saveNow();
+  if(!undoStack.length){toast('더 되돌릴 게 없어요.');return;}
+  if(!$('#sheet').classList.contains('hidden')){sheetOnClose=null;closeSheet();}
+  const prev=undoStack.pop(); cur.items=JSON.parse(prev); lastItems=prev; lastPushAt=0;
+  cur.updatedAt=Date.now();
+  try{await put('scores',JSON.parse(JSON.stringify(cur)));}catch(e){storageFailed();mem.scores.set(cur.id,cur);}
+  for(const pg of cur.pages)renderOverlay(pg.id);
+  updateUndoBtn(); toast('한 단계 되돌렸어요.');
+}
 async function saveNow(){
   clearTimeout(saveTimer); if(!cur)return;
+  trackUndo();
   cur.updatedAt=Date.now();
   try{await put('scores',JSON.parse(JSON.stringify(cur)));}catch(e){storageFailed();mem.scores.set(cur.id,cur);}
 }
@@ -493,7 +523,7 @@ async function pdfToPages(file){
 /* ---------- score view ---------- */
 function openScore(s){
   cur=s; $('#libraryWrap').classList.add('hidden'); $('#scoreView').classList.remove('hidden');
-  $('#scoreTitle').textContent=s.title; setMode('view'); renderPages();
+  $('#scoreTitle').textContent=s.title; setMode('view'); renderPages(); resetUndo();
 }
 async function goHome(){
   await saveNow(); cur=null; closeSheet();
@@ -506,14 +536,25 @@ function layoutPages(){
 }
 new ResizeObserver(layoutPages).observe(document.getElementById('scroller'));
 
+/* many-page scores: only keep pages near the screen loaded, so iPhone memory doesn't run out */
+const lazyIO=new IntersectionObserver(entries=>{
+  for(const en of entries){
+    const el=en.target, img=el.querySelector('img.scan'); if(!img)continue;
+    if(en.isIntersecting){
+      if(!img.getAttribute('src'))pageURL(el.dataset.page).then(u=>{if(u&&el.isConnected)img.src=u;});
+    }else if(img.getAttribute('src')){
+      img.removeAttribute('src');
+    }
+  }
+},{rootMargin:'150% 0px'});
 function renderPages(){
+  lazyIO.disconnect();
   const wrap=$('#pages'); wrap.innerHTML='';
   if(!cur.pages.length){wrap.innerHTML='<div class="empty" style="margin:20px">페이지가 없어요. ⋯ 메뉴에서 페이지를 추가하세요.</div>';return;}
   cur.pages.forEach((p,i)=>{
     const el=document.createElement('div'); el.className='page'; el.dataset.page=p.id; el.style.aspectRatio=`${p.w}/${p.h}`;
-    el.innerHTML=`<img class="scan" alt="악보 ${i+1}쪽"><div class="layer"></div><span class="pno">${i+1}쪽</span>`;
-    wrap.appendChild(el); ro.observe(el);
-    pageURL(p.id).then(u=>{if(u)el.querySelector('img').src=u;});
+    el.innerHTML=`<img class="scan" decoding="async" alt="악보 ${i+1}쪽"><div class="layer"></div><span class="pno">${i+1}쪽</span>`;
+    wrap.appendChild(el); ro.observe(el); lazyIO.observe(el);
     bindLayer(el,p); renderOverlay(p.id);
   });
   layoutPages();
@@ -546,7 +587,7 @@ function renderOverlay(pageId){
       for(let k=0;k<5;k++){const y=15+k*20;s+=`<line x1="4" x2="496" y1="${y}" y2="${y}" stroke="#555" stroke-width="1.2"/>`;}
       for(const st of it.strokes)s+=`<path d="${pathD(st)}" stroke="${it.color}" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/>`;
       s+='</svg>';
-      html+=`<div class="staff" data-id="${it.id}" style="left:${it.x*100}%;top:${it.y*100}%;width:${it.w*100}%">${s}</div>`;
+      html+=`<div class="staff" data-id="${it.id}" style="left:${it.x*100}%;top:${it.y*100}%;width:${it.w*100}%">${s}<span class="hdl hdl-move" aria-label="오선 옮기기">✥</span><span class="hdl hdl-size" aria-label="오선 크기">⤡</span></div>`;
     }
   }
   layer.innerHTML=html;
@@ -560,11 +601,28 @@ function pathD(pts){
 }
 function frac(e,el){const r=el.getBoundingClientRect();return{x:clamp((e.clientX-r.left)/r.width,0,1),y:clamp((e.clientY-r.top)/r.height,0,1)};}
 
+let suppressClick=0;
 function bindLayer(el,p){
   const layer=el.querySelector('.layer');
   let drag=null;
   layer.addEventListener('pointerdown',e=>{
     const target=e.target;
+    const r0=el.getBoundingClientRect();
+    // staff: move / resize handles (any mode)
+    const hdl=target.closest('.hdl');
+    if(hdl){
+      const sEl=hdl.closest('.staff'); const it=cur.items.find(i=>i.id===sEl.dataset.id);
+      if(hdl.classList.contains('hdl-size'))drag={kind:'resize',el:sEl,it,sx:e.clientX,ow:it.w,rw:r0.width,moved:false};
+      else drag={kind:'item',el:sEl,it,sx:e.clientX,sy:e.clientY,ox:it.x,oy:it.y,rw:r0.width,rh:r0.height,moved:false,fromHandle:true};
+      hdl.setPointerCapture(e.pointerId); e.preventDefault(); e.stopPropagation(); return;
+    }
+    // comments can be dragged in any mode except pen
+    const cm0=target.closest('.cmt');
+    if(cm0&&mode!=='pen'){
+      const reg=cur.items.find(i=>i.id===cm0.dataset.region); const c=reg.comments.find(x=>x.id===cm0.dataset.id);
+      drag={kind:'cmt',el:cm0,reg,c,sx:e.clientX,sy:e.clientY,ox:c.dx||0,oy:c.dy||0,pw:r0.width,moved:false};
+      cm0.setPointerCapture(e.pointerId); e.preventDefault(); e.stopPropagation(); return;
+    }
     // staff drawing
     if(mode==='staff'&&target.closest('.staff')){
       const sEl=target.closest('.staff'); const it=cur.items.find(i=>i.id===sEl.dataset.id);
@@ -618,6 +676,9 @@ function bindLayer(el,p){
     }else if(drag.kind==='cmt'){
       const dx=e.clientX-drag.sx,dy=e.clientY-drag.sy; if(Math.hypot(dx,dy)>6)drag.moved=true;
       if(drag.moved){drag.c.dx=drag.ox+dx/drag.pw;drag.c.dy=drag.oy+dy/drag.pw;drag.el.style.transform=`translate(calc(var(--pw) * ${drag.c.dx}),calc(var(--pw) * ${drag.c.dy}))`;}
+    }else if(drag.kind==='resize'){
+      const dx=e.clientX-drag.sx; if(Math.abs(dx)>4)drag.moved=true;
+      drag.it.w=clamp(drag.ow+dx/drag.rw,0.12,1-drag.it.x); drag.el.style.width=drag.it.w*100+'%';
     }else if(drag.kind==='item'){
       const dx=e.clientX-drag.sx,dy=e.clientY-drag.sy; if(Math.hypot(dx,dy)>6)drag.moved=true;
       if(drag.moved){drag.it.x=clamp(drag.ox+dx/drag.rw,0,1);drag.it.y=clamp(drag.oy+dy/drag.rh,0,1);drag.el.style.left=drag.it.x*100+'%';drag.el.style.top=drag.it.y*100+'%';}
@@ -625,6 +686,9 @@ function bindLayer(el,p){
   };
   const up=e=>{
     if(!drag)return; const d=drag; drag=null;
+    if(d.kind==='resize'||d.kind==='cmt'||d.kind==='item'){suppressClick=Date.now();}
+    if(d.kind==='resize'){saveSoon();return;}
+    if(d.kind==='item'&&d.fromHandle){if(d.moved)saveSoon();return;}
     if(d.kind==='region'){
       d.pv.remove();
       if(d.rect&&d.rect.w>0.03&&d.rect.h>0.015){
@@ -646,6 +710,7 @@ function bindLayer(el,p){
 
   layer.addEventListener('click',e=>{
     const t=e.target;
+    if(Date.now()-suppressClick<400)return;
     if(mode==='view'){
       const reg=t.closest('.region'); if(reg){openRegionSheet(cur.items.find(i=>i.id===reg.dataset.id));}
       return;
@@ -674,7 +739,7 @@ function setMode(m){
 function swatches(key){return COLORS.map(c=>`<button class="swatch ${prefs[key]===c?'on':''}" style="background:${c}" data-color="${c}" data-key="${key}" aria-label="${COLOR_NAMES[c]}"></button>`).join('');}
 function renderOptbar(){
   const o=$('#optbar'); let h='';
-  if(mode==='view') h=`<span class="hint">스크롤해서 보고, 코멘트·기호는 끌어서 옮기거나 눌러서 고치세요.</span>`;
+  if(mode==='view') h=`<span class="hint">코멘트·기호는 끌어서 옮기고, 오선은 ✥로 옮기고 ⤡로 크기를 바꿔요. 잘못하면 위의 ↶.</span>`;
   if(mode==='region') h=`<span class="hint">🎙 코멘트를 달 마디를 손가락으로 끌어서 감싸세요 (1~4마디).</span>`;
   if(mode==='finger') h=[1,2,3,4,5].map(n=>`<button class="chip ${prefs.finger==n?'on':''}" data-opt="finger" data-v="${n}">${n}</button>`).join('')+`<button class="chip ${prefs.finger==='1-3'?'on':''}" data-opt="finger" data-v="1-3">1-3</button><span class="sep"></span>`+swatches('color');
   if(mode==='symbol') h=[...DYN.slice(1,7)].map(s=>`<button class="chip dyn ${prefs.symbol===s?'on':''}" data-opt="symbol" data-v="${s}">${s}</button>`).join('')
@@ -682,7 +747,7 @@ function renderOptbar(){
       +WORDS.map(s=>`<button class="chip dyn ${prefs.symbol===s?'on':''}" data-opt="symbol" data-v="${esc(s)}">${esc(s)}</button>`).join('')
       +`<span class="sep"></span>`+swatches('color');
   if(mode==='chord') h=CHORDS.map(s=>`<button class="chip ${prefs.chord===s?'on':''}" data-opt="chord" data-v="${s}">${s}</button>`).join('')+`<button class="chip" data-opt="chord-custom">직접 입력</button><span class="sep"></span>`+swatches('color');
-  if(mode==='staff') h=`<span class="hint">빈 곳을 누르면 오선이 생겨요. 오선 안에 그려 넣으세요.</span><span class="sep"></span>`+swatches('color');
+  if(mode==='staff') h=`<span class="hint">빈 곳을 누르면 오선이 생겨요. ✥ 옮기기 · ⤡ 크기 조절</span><span class="sep"></span>`+swatches('color');
   if(mode==='pen') h=swatches('penColor')+`<span class="sep"></span>`+[2,3,6].map((w,i)=>`<button class="chip ${prefs.penW==w?'on':''}" data-opt="penW" data-v="${w}">${['가늘게','보통','굵게'][i]}</button>`).join('')+`<span class="sep"></span><button class="chip" data-opt="undo-ink">마지막 획 지우기</button>`;
   o.innerHTML=h;
 }
@@ -723,7 +788,6 @@ function openRegionSheet(r){
     if(a.dataset.act==='del-region'){
       const n=r.comments.length;
       if(await confirmBox(n?`이 마디의 코멘트 ${n}개와 녹음까지 모두 지워집니다. 지울까요?`:'이 마디 선택을 지울까요?')){
-        for(const c of r.comments)if(c.audio)await del('audio',c.audio);
         cur.items.splice(cur.items.indexOf(r),1); await saveNow(); closeSheet(); renderOverlay(r.page);
       }
     }
@@ -842,7 +906,6 @@ function openCommentEditor(r,c,fresh){
     if(a.dataset.act==='back'){await saveNow();sheetOnClose=null;openRegionSheet(r);}
     if(a.dataset.act==='del-c'){
       if(await confirmBox(c.audio?'이 코멘트와 녹음을 지울까요?':'이 코멘트를 지울까요?')){
-        if(c.audio)await del('audio',c.audio);
         r.comments.splice(r.comments.indexOf(c),1); await saveNow(); renderOverlay(r.page); sheetOnClose=null; openRegionSheet(r);
       }
     }
@@ -979,6 +1042,7 @@ document.addEventListener('click',e=>{
   if(act==='livecam-new')openLiveCam(null);
   if(act==='home')goHome();
   if(act==='menu')openMenu();
+  if(act==='undo')undo();
   if(act==='zoom-in'){zoom=Math.min(3,+(zoom+0.25).toFixed(2));layoutPages();}
   if(act==='zoom-out'){zoom=Math.max(0.5,+(zoom-0.25).toFixed(2));layoutPages();}
   if(act==='backup')backup();
